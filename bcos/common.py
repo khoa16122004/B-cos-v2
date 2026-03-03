@@ -28,6 +28,7 @@ __all__ = [
     "BcosUtilMixin",
     "explanation_mode",
     "gradient_to_image",
+    "normalize_contribution_map",
     "plot_contribution_map",
 ]
 
@@ -484,10 +485,9 @@ def plot_contribution_map(
     assert (
         contribution_map.ndim == 2
     ), "Contribution map is supposed to only have 2 spatial dimensions."
-    if isinstance(contribution_map, torch.Tensor):
-        contribution_map = contribution_map.detach().cpu().numpy()
-    cutoff = np.percentile(np.abs(contribution_map), percentile)
-    contribution_map = np.clip(contribution_map, -cutoff, cutoff)
+    contribution_map = normalize_contribution_map(
+        contribution_map, percentile=percentile, return_zero_one=False
+    )
 
     if ax is None:
         import matplotlib.pyplot as plt  # noqa
@@ -508,3 +508,47 @@ def plot_contribution_map(
         ax.set_yticks([])
 
     return ax, im
+
+
+def normalize_contribution_map(
+    contribution_map: TensorLike,
+    percentile: float = 99.5,
+    return_zero_one: bool = True,
+) -> np.ndarray:
+    """
+    Normalizes a contribution map using the same percentile clipping used by
+    ``plot_contribution_map``.
+
+    Parameters
+    ----------
+    contribution_map: TensorLike
+        (H, W) matrix of contributions.
+    percentile: float
+        Percentile used to clip absolute values before normalization.
+    return_zero_one: bool
+        If True, returns values in [0, 1].
+        If False, returns values in [-1, 1].
+
+    Returns
+    -------
+    np.ndarray
+        Normalized 2D contribution map.
+    """
+    if isinstance(contribution_map, torch.Tensor):
+        contribution_map = contribution_map.detach().cpu().numpy()
+
+    contribution_map = np.asarray(contribution_map, dtype=np.float32)
+    assert (
+        contribution_map.ndim == 2
+    ), "Contribution map is supposed to only have 2 spatial dimensions."
+
+    cutoff = float(np.percentile(np.abs(contribution_map), percentile))
+    if cutoff <= 0:
+        normalized = np.zeros_like(contribution_map, dtype=np.float32)
+    else:
+        clipped = np.clip(contribution_map, -cutoff, cutoff)
+        normalized = clipped / cutoff
+
+    if return_zero_one:
+        return (normalized + 1.0) / 2.0
+    return normalized
