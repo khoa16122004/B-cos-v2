@@ -26,12 +26,14 @@ class AttackConfig:
     image_path: Path
     output_dir: Path
     iterations: int
-    parents: int
-    children_per_parent: int
     population_size: int
     l2_max: float
     mutation_sigma_min: float
     mutation_sigma_max: float
+    archive_sampling_temperature: float
+    far_parent_prob: float
+    far_parent_pool: int
+    immigrant_fraction: float
     iou_bins: int
     l2_bins: int
     map_threshold_percentile: float
@@ -120,30 +122,19 @@ def project_l2(delta: torch.Tensor, l2_max: float) -> torch.Tensor:
     return delta * (l2_max / (norm + 1e-12))
 
 
-def set_l2(delta: torch.Tensor, target_l2: float) -> torch.Tensor:
-    if target_l2 <= 0:
-        return torch.zeros_like(delta)
-
-    norm = float(delta.flatten().norm(p=2).item())
-    if norm < 1e-12:
-        direction = torch.randn_like(delta)
-        direction_norm = direction.flatten().norm(p=2)
-        return direction * (target_l2 / (direction_norm + 1e-12))
-
-    return delta * (target_l2 / (norm + 1e-12))
-
-
 class QDMap:
     def __init__(self, iou_bins: int, l2_bins: int, l2_max: float):
         self.iou_bins = iou_bins
         self.l2_bins = l2_bins
         self.l2_max = l2_max
 
+        self.quality_ce = torch.full((iou_bins, l2_bins), float("inf"), dtype=torch.float32)
         self.margin_loss = torch.full((iou_bins, l2_bins), float("inf"), dtype=torch.float32)
         self.iou = torch.zeros((iou_bins, l2_bins), dtype=torch.float32)
         self.l2 = torch.zeros((iou_bins, l2_bins), dtype=torch.float32)
         self.pred = torch.full((iou_bins, l2_bins), -1, dtype=torch.long)
-        self.success = torch.zeros((iou_bins, l2_bins), dtype=torch.bool)
+        self.consistent = torch.zeros((iou_bins, l2_bins), dtype=torch.bool)
+        self.sample_count = torch.zeros((iou_bins, l2_bins), dtype=torch.int32)
         self.delta = {}
 
     def _bin_indices(self, iou_value: float, l2_value: float) -> Tuple[int, int]:
@@ -154,32 +145,59 @@ class QDMap:
 
     def try_insert(
         self,
-        margin_value: float,
+        ce_value: float,
         iou_value: float,
         l2_value: float,
         pred_class: int,
-        is_success: bool,
+        is_consistent: bool,
         delta: torch.Tensor,
     ) -> bool:
         i_idx, l_idx = self._bin_indices(iou_value, l2_value)
-        if margin_value >= float(self.margin_loss[i_idx, l_idx]):
+        if ce_value >= float(self.quality_ce[i_idx, l_idx]):
             return False
-        self.margin_loss[i_idx, l_idx] = margin_value
+        self.quality_ce[i_idx, l_idx] = ce_value
         self.iou[i_idx, l_idx] = iou_value
         self.l2[i_idx, l_idx] = l2_value
         self.pred[i_idx, l_idx] = pred_class
-        self.success[i_idx, l_idx] = is_success
+        self.consistent[i_idx, l_idx] = is_consistent
         self.delta[(i_idx, l_idx)] = delta.detach().cpu().clone()
         return True
 
+    def increment_sample_count(self, cell: Tuple[int, int]) -> None:
+        i_idx, l_idx = cell
+        self.sample_count[i_idx, l_idx] += 1
+
+    def get_sampling_weights(self, occupied_cells: List[Tuple[int, int]], temperature: float) -> np.ndarray:
+        if len(occupied_cells) == 0:
+            return np.array([], dtype=np.float64)
+
+        t = max(0.0, float(temperature))
+        weights = []
+        for i_idx, l_idx in occupied_cells:
+            count = float(self.sample_count[i_idx, l_idx].item())
+            w = 1.0 / ((1.0 + count) ** (1.0 + t))
+            weights.append(w)
+
+        weights_arr = np.asarray(weights, dtype=np.float64)
+        total = float(weights_arr.sum())
+        if total <= 0.0:
+            return np.full(len(occupied_cells), 1.0 / len(occupied_cells), dtype=np.float64)
+        return weights_arr / total
+
     def occupied_cells(self) -> int:
-        return int(torch.isfinite(self.margin_loss).sum().item())
+        return int(torch.isfinite(self.quality_ce).sum().item())
+
+    def occupied_cell_indices(self) -> List[Tuple[int, int]]:
+        """
+        Return list of (iou_idx, l2_idx) that currently contain an elite.
+        """
+        return list(self.delta.keys())
 
     def elites(self) -> List[Tuple[Tuple[int, int], torch.Tensor, float]]:
         result = []
         for key, value in self.delta.items():
             i_idx, l_idx = key
-            result.append((key, value, float(self.margin_loss[i_idx, l_idx].item())))
+            result.append((key, value, float(self.quality_ce[i_idx, l_idx].item())))
         result.sort(key=lambda item: item[2])
         return result
 
@@ -197,7 +215,8 @@ def evaluate_candidates_batch(
 
     with torch.no_grad():
         logits = model(candidates_x)
-        margin_values = compute_margin_loss(logits, original_class)
+        targets = torch.full((logits.shape[0],), original_class, dtype=torch.long, device=logits.device)
+        ce_values = F.cross_entropy(logits, targets, reduction="none")
         pred_classes = logits.argmax(dim=1)
 
     candidate_weight_maps = get_weight_maps_batch(model, candidates_x, original_class)
@@ -209,25 +228,19 @@ def evaluate_candidates_batch(
         iou_value = iou_score(original_binary_map, candidate_binary)
         l2_value = l2_norm(deltas[i : i + 1])
         pred_class = int(pred_classes[i].item())
-        is_success = pred_class != original_class
+        is_consistent = pred_class == original_class
 
         results.append(
             {
-                "margin_loss": float(margin_values[i].item()),
+                "ce_loss": float(ce_values[i].item()),
                 "pred": pred_class,
                 "iou": iou_value,
                 "l2": l2_value,
-                "success": is_success,
+                "consistent": is_consistent,
                 "delta": deltas[i : i + 1],
             }
         )
     return results
-
-
-def mutate_from_parent(parent_delta: torch.Tensor, sigma: float, l2_max: float) -> torch.Tensor:
-    noise = torch.randn_like(parent_delta) * sigma
-    child = parent_delta + noise
-    return project_l2(child, l2_max)
 
 
 def crossover(parent_a: torch.Tensor, parent_b: torch.Tensor, alpha: float) -> torch.Tensor:
@@ -237,6 +250,8 @@ def crossover(parent_a: torch.Tensor, parent_b: torch.Tensor, alpha: float) -> t
 def init_population(population_size: int, sample_shape: Tuple[int, ...], l2_max: float, device: torch.device) -> torch.Tensor:
     if population_size <= 0:
         raise ValueError("population_size must be > 0")
+    if l2_max <= 0:
+        raise ValueError("l2_max must be > 0")
 
     population = torch.randn((population_size, *sample_shape), device=device)
     flat = population.flatten(1)
@@ -254,20 +269,29 @@ def init_population(population_size: int, sample_shape: Tuple[int, ...], l2_max:
     return scaled.view(population.shape)
 
 
-def select_top_population(
-    merged_deltas: torch.Tensor,
-    merged_results: List[Dict[str, object]],
-    keep_n: int,
-) -> Tuple[torch.Tensor, List[Dict[str, object]]]:
-    sorted_indices = sorted(
-        range(len(merged_results)),
-        key=lambda i: float(merged_results[i]["margin_loss"]),
-    )[:keep_n]
+def sample_population_from_archive(
+    qd_map: QDMap,
+    population_size: int,
+    device: torch.device,
+    fallback_delta: torch.Tensor,
+    archive_sampling_temperature: float,
+) -> torch.Tensor:
+    occupied = qd_map.occupied_cell_indices()
 
-    index_tensor = torch.tensor(sorted_indices, device=merged_deltas.device, dtype=torch.long)
-    next_population = merged_deltas.index_select(0, index_tensor)
-    next_results = [merged_results[i] for i in sorted_indices]
-    return next_population, next_results
+    if len(occupied) == 0:
+        return fallback_delta.repeat(population_size, 1, 1, 1)
+
+    sampled = []
+    probs = qd_map.get_sampling_weights(occupied, temperature=archive_sampling_temperature)
+
+    for _ in range(population_size):
+        cell_idx = int(np.random.choice(len(occupied), p=probs))
+        cell = occupied[cell_idx]
+        qd_map.increment_sample_count(cell)
+        delta = qd_map.delta[cell]
+        sampled.append(delta.to(device))
+
+    return torch.cat(sampled, dim=0)
 
 
 def run_attack(config: AttackConfig) -> Dict[str, object]:
@@ -284,6 +308,8 @@ def run_attack(config: AttackConfig) -> Dict[str, object]:
         print("Base logits:", base_logits.shape)
         original_class = int(base_logits.argmax(dim=1).item())
         print("Original predicted class:", original_class)
+        base_ce_loss = float(F.cross_entropy(base_logits, torch.tensor([original_class], device=device)).item())
+        print("Original CE loss:", base_ce_loss)
         base_margin_loss = float(compute_margin_loss(base_logits, original_class)[0].item())
         print("Original margin loss:", base_margin_loss)
     base_weight_map = get_weight_maps_batch(model, base_x, original_class)[0]
@@ -301,7 +327,7 @@ def run_attack(config: AttackConfig) -> Dict[str, object]:
         device=device,
     )
 
-    population_results = evaluate_candidates_batch(
+    init_results = evaluate_candidates_batch(
         model,
         base_rgb,
         population,
@@ -309,33 +335,58 @@ def run_attack(config: AttackConfig) -> Dict[str, object]:
         base_binary_map,
         config.map_threshold_percentile,
     )
-    for result in population_results:
+    for result in init_results:
         qd_map.try_insert(
-            margin_value=result["margin_loss"],
+            ce_value=result["ce_loss"],
             iou_value=result["iou"],
             l2_value=result["l2"],
             pred_class=result["pred"],
-            is_success=result["success"],
+            is_consistent=result["consistent"],
             delta=result["delta"],
         )
 
-    history_best_margin_loss = [
-        float(min(float(result["margin_loss"]) for result in population_results))
-    ]
-    history_success_cells = [int(qd_map.success.sum().item())]
+    history_best_ce_loss = [float(min(float(result["ce_loss"]) for result in init_results))]
+    history_consistent_cells = [int(qd_map.consistent.sum().item())]
+
+    zero_delta = torch.zeros_like(base_rgb)
+    population = sample_population_from_archive(
+        qd_map=qd_map,
+        population_size=config.population_size,
+        device=device,
+        fallback_delta=zero_delta,
+        archive_sampling_temperature=config.archive_sampling_temperature,
+    )
 
     for step in range(config.iterations):
         num_candidates = population.shape[0]
+        far_parent_prob = min(max(config.far_parent_prob, 0.0), 1.0)
+        far_parent_pool = max(1, min(config.far_parent_pool, max(1, num_candidates - 1)))
 
+        population_flat = population.flatten(1)
         children = []
         for _ in range(num_candidates):
             parent_a_idx = int(np.random.randint(num_candidates))
-            parent_b_idx = int(np.random.randint(num_candidates))
+
+            if np.random.rand() < far_parent_prob and num_candidates > 1:
+                distances = torch.norm(population_flat - population_flat[parent_a_idx:parent_a_idx + 1], p=2, dim=1)
+                distances[parent_a_idx] = -1.0
+                k = min(far_parent_pool, num_candidates - 1)
+                far_candidates = torch.topk(distances, k=k, largest=True).indices.detach().cpu().numpy()
+                parent_b_idx = int(far_candidates[np.random.randint(len(far_candidates))])
+            else:
+                parent_b_idx = int(np.random.randint(num_candidates))
+
             parent_a = population[parent_a_idx : parent_a_idx + 1]
             parent_b = population[parent_b_idx : parent_b_idx + 1]
 
             alpha = float(np.random.uniform(0.2, 0.8))
             child_delta = crossover(parent_a, parent_b, alpha=alpha)
+            current_l2 = l2_norm(parent_a)
+            ratio = current_l2 / max(config.l2_max, 1e-12)
+
+            sigma = config.mutation_sigma_min + \
+                (1 - ratio) * (config.mutation_sigma_max - config.mutation_sigma_min)
+            child_delta = child_delta + torch.randn_like(child_delta) * sigma
             child_delta = project_l2(child_delta, l2_max=config.l2_max)
             children.append(child_delta)
 
@@ -352,58 +403,72 @@ def run_attack(config: AttackConfig) -> Dict[str, object]:
 
         for result in children_results:
             qd_map.try_insert(
-                margin_value=result["margin_loss"],
+                ce_value=result["ce_loss"],
                 iou_value=result["iou"],
                 l2_value=result["l2"],
                 pred_class=result["pred"],
-                is_success=result["success"],
+                is_consistent=result["consistent"],
                 delta=result["delta"],
             )
 
-        merged_population = torch.cat([population, children], dim=0)
-        merged_results = population_results + children_results
-        population, population_results = select_top_population(
-            merged_deltas=merged_population,
-            merged_results=merged_results,
-            keep_n=config.population_size,
+        population = sample_population_from_archive(
+            qd_map=qd_map,
+            population_size=config.population_size,
+            device=device,
+            fallback_delta=zero_delta,
+            archive_sampling_temperature=config.archive_sampling_temperature,
         )
 
-        finite_mask = torch.isfinite(qd_map.margin_loss)
-        best_margin_loss = float(qd_map.margin_loss[finite_mask].min().item())
-        history_best_margin_loss.append(best_margin_loss)
-        history_success_cells.append(int(qd_map.success.sum().item()))
+        immigrant_fraction = min(max(config.immigrant_fraction, 0.0), 1.0)
+        immigrant_count = int(round(immigrant_fraction * config.population_size))
+        if immigrant_count > 0:
+            immigrants = init_population(
+                population_size=immigrant_count,
+                sample_shape=tuple(base_rgb.shape[1:]),
+                l2_max=config.l2_max,
+                device=device,
+            )
+            replace_indices = np.random.choice(config.population_size, size=immigrant_count, replace=False)
+            population[torch.as_tensor(replace_indices, device=device)] = immigrants
+
+        finite_mask = torch.isfinite(qd_map.quality_ce)
+        best_ce_loss = float(qd_map.quality_ce[finite_mask].min().item())
+        history_best_ce_loss.append(best_ce_loss)
+        history_consistent_cells.append(int(qd_map.consistent.sum().item()))
 
         print(
-            f"[Iter {step + 1:03d}] best_margin={best_margin_loss:.6f} occupied={qd_map.occupied_cells()} success_cells={int(qd_map.success.sum().item())} parents={config.population_size} children={num_candidates} eval_batch={num_candidates}"
+            f"[Iter {step + 1:03d}] best_ce={best_ce_loss:.6f} occupied={qd_map.occupied_cells()} consistent_cells={int(qd_map.consistent.sum().item())} parents={config.population_size} children={num_candidates} eval_batch={num_candidates} archive_sample=curiosity(t={config.archive_sampling_temperature:.2f}) far_parent_prob={far_parent_prob:.2f} immigrants={immigrant_count}"
         )
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         config.output_dir / "qd_map_metrics.npz",
+        quality_ce=qd_map.quality_ce.numpy(),
         margin_loss=qd_map.margin_loss.numpy(),
         iou=qd_map.iou.numpy(),
         l2=qd_map.l2.numpy(),
         pred=qd_map.pred.numpy(),
-        success=qd_map.success.numpy(),
-        history_best_margin_loss=np.array(history_best_margin_loss, dtype=np.float32),
-        history_success_cells=np.array(history_success_cells, dtype=np.int32),
+        consistent=qd_map.consistent.numpy(),
+        history_best_ce_loss=np.array(history_best_ce_loss, dtype=np.float32),
+        history_consistent_cells=np.array(history_consistent_cells, dtype=np.int32),
     )
 
     all_elites = qd_map.elites()
     all_elites_dir = config.output_dir / "all_elites"
     all_elites_dir.mkdir(parents=True, exist_ok=True)
     qd_cells = []
-    for (i_idx, l_idx), delta_tensor, margin_value in all_elites:
+    for (i_idx, l_idx), delta_tensor, ce_value in all_elites:
         path = all_elites_dir / f"elite_iou{i_idx}_l2{l_idx}.pt"
         torch.save(delta_tensor, path)
         qd_cells.append(
             {
                 "cell": [i_idx, l_idx],
-                "margin_loss": margin_value,
+                "quality_ce": ce_value,
+                "margin_loss": float(qd_map.margin_loss[i_idx, l_idx].item()),
                 "iou": float(qd_map.iou[i_idx, l_idx].item()),
                 "l2": float(qd_map.l2[i_idx, l_idx].item()),
                 "pred": int(qd_map.pred[i_idx, l_idx].item()),
-                "success": bool(qd_map.success[i_idx, l_idx].item()),
+                "consistent": bool(qd_map.consistent[i_idx, l_idx].item()),
                 "delta_path": str(path),
             }
         )
@@ -412,13 +477,21 @@ def run_attack(config: AttackConfig) -> Dict[str, object]:
         "model_name": config.model_name,
         "image_path": str(config.image_path),
         "device": str(device),
+        "iou_bins": config.iou_bins,
+        "l2_bins": config.l2_bins,
+        "l2_max": config.l2_max,
         "original_class": original_class,
+        "base_ce_loss": base_ce_loss,
         "base_margin_loss": base_margin_loss,
         "iterations": config.iterations,
+        "archive_sampling_temperature": config.archive_sampling_temperature,
+        "far_parent_prob": config.far_parent_prob,
+        "far_parent_pool": config.far_parent_pool,
+        "immigrant_fraction": config.immigrant_fraction,
         "occupied_cells": qd_map.occupied_cells(),
-        "success_cells": int(qd_map.success.sum().item()),
-        "best_margin_loss": float(min(history_best_margin_loss)),
-        "history_best_margin_loss": history_best_margin_loss,
+        "consistent_cells": int(qd_map.consistent.sum().item()),
+        "best_quality_ce": float(min(history_best_ce_loss)),
+        "history_best_ce_loss": history_best_ce_loss,
         "qd_cells": qd_cells,
         "top_elites": qd_cells[:10],
     }
@@ -430,20 +503,22 @@ def run_attack(config: AttackConfig) -> Dict[str, object]:
 
 def parse_args() -> AttackConfig:
     parser = argparse.ArgumentParser(
-        description="Black-box Evolution Strategy QD attack with descriptors (IoU weight-map, L2)."
+        description="Black-box Evolution Strategy QD optimization minimizing CE on original class (consistency objective)."
     )
     parser.add_argument("--model", default="resnet50", help="Model entrypoint from bcos.models.pretrained")
     parser.add_argument("--image", type=Path, required=True, help="Input image path")
     parser.add_argument("--output_dir", type=Path, default=Path("results/qd_es_attack"))
     parser.add_argument("--iterations", type=int, default=12)
-    parser.add_argument("--parents", type=int, default=4)
-    parser.add_argument("--children_per_parent", type=int, default=8)
     parser.add_argument("--population_size", type=int, default=256)
-    parser.add_argument("--l2_max", type=float, default=22.0)
+    parser.add_argument("--l2_max", type=float, default=50.0)
     parser.add_argument("--mutation_sigma_min", type=float, default=0.05)
-    parser.add_argument("--mutation_sigma_max", type=float, default=0.35)
-    parser.add_argument("--iou_bins", type=int, default=16)
-    parser.add_argument("--l2_bins", type=int, default=16)
+    parser.add_argument("--mutation_sigma_max", type=float, default=0.05)
+    parser.add_argument("--archive_sampling_temperature", type=float, default=1.0)
+    parser.add_argument("--far_parent_prob", type=float, default=0.6)
+    parser.add_argument("--far_parent_pool", type=int, default=8)
+    parser.add_argument("--immigrant_fraction", type=float, default=0.2)
+    parser.add_argument("--iou_bins", type=int, default=8)
+    parser.add_argument("--l2_bins", type=int, default=8)
     parser.add_argument("--map_threshold_percentile", type=float, default=85.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -454,12 +529,14 @@ def parse_args() -> AttackConfig:
         image_path=args.image,
         output_dir=args.output_dir,
         iterations=args.iterations,
-        parents=args.parents,
-        children_per_parent=args.children_per_parent,
         population_size=args.population_size,
         l2_max=args.l2_max,
         mutation_sigma_min=args.mutation_sigma_min,
         mutation_sigma_max=args.mutation_sigma_max,
+        archive_sampling_temperature=args.archive_sampling_temperature,
+        far_parent_prob=args.far_parent_prob,
+        far_parent_pool=args.far_parent_pool,
+        immigrant_fraction=args.immigrant_fraction,
         iou_bins=args.iou_bins,
         l2_bins=args.l2_bins,
         map_threshold_percentile=args.map_threshold_percentile,
@@ -474,8 +551,9 @@ if __name__ == "__main__":
     print("\nAttack summary")
     print(json.dumps({
         "original_class": result["original_class"],
+        "base_ce_loss": result["base_ce_loss"],
         "base_margin_loss": result["base_margin_loss"],
-        "best_margin_loss": result["best_margin_loss"],
+        "best_quality_ce": result["best_quality_ce"],
         "occupied_cells": result["occupied_cells"],
-        "success_cells": result["success_cells"],
+        "consistent_cells": result["consistent_cells"],
     }, indent=2))

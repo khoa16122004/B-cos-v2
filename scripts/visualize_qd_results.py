@@ -8,6 +8,7 @@ from typing import Dict, List
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torchvision.transforms import functional as TF
 
@@ -47,31 +48,16 @@ def preprocess_image(model: torch.nn.Module, image_path: Path, device: torch.dev
     return rgb.unsqueeze(0).to(device)
 
 
+def to_model_input(x_rgb: torch.Tensor) -> torch.Tensor:
+    return torch.cat([x_rgb, 1.0 - x_rgb], dim=1)
+
+
 def class_name(idx: int) -> str:
     if idx < 0:
         return "UNKNOWN"
     if idx < len(IMAGENET_CATEGORIES):
         return IMAGENET_CATEGORIES[idx]
     return f"class_{idx}"
-
-
-def read_summary(summary_path: Path) -> Dict[str, object]:
-    with open(summary_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_elite_map(margin_loss: np.ndarray, out_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(7, 6), dpi=140)
-
-    values = np.where(np.isfinite(margin_loss), margin_loss, np.nan)
-    image = ax.imshow(values, origin="lower", cmap="viridis", interpolation="nearest")
-    ax.set_title("Elite Map (one elite candidate per occupied cell)")
-    ax.set_xlabel("L2 bin")
-    ax.set_ylabel("IoU bin")
-    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    fig.savefig(out_path)
-    plt.close(fig)
 
 
 def save_candidate_rgb(x_candidate_rgb: torch.Tensor, out_path: Path, title: str) -> None:
@@ -88,8 +74,41 @@ def save_candidate_rgb(x_candidate_rgb: torch.Tensor, out_path: Path, title: str
     plt.close(fig)
 
 
-def to_model_input(x_rgb: torch.Tensor) -> torch.Tensor:
-    return torch.cat([x_rgb, 1.0 - x_rgb], dim=1)
+def save_weight_map(weight_map: torch.Tensor, out_path: Path, title: str) -> None:
+    arr = weight_map.detach().cpu().numpy()
+    vmax = float(np.nanmax(np.abs(arr)))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+
+    fig, ax = plt.subplots(figsize=(4, 4), dpi=140)
+    image = ax.imshow(arr, cmap="bwr", vmin=-vmax, vmax=vmax)
+    ax.set_title(title)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def save_elite_map(quality_map: np.ndarray, out_path: Path, l2_max: float, quality_label: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 6), dpi=140)
+    values = np.where(np.isfinite(quality_map), quality_map, np.nan)
+    image = ax.imshow(
+        values,
+        origin="lower",
+        cmap="viridis_r",
+        interpolation="nearest",
+        extent=(0.0, float(l2_max), 0.0, 1.0),
+        aspect="auto",
+    )
+    ax.set_title(f"Elite map ({quality_label}, lower is better)")
+    ax.set_xlabel("L2")
+    ax.set_ylabel("IoU")
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def reconstruct_candidate_rgb(base_rgb: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
@@ -107,8 +126,22 @@ def reconstruct_candidate_rgb(base_rgb: torch.Tensor, delta: torch.Tensor) -> to
     raise ValueError(f"Unsupported delta channel size: {delta.shape[1]}")
 
 
+def get_prediction_info(model: torch.nn.Module, x_candidate: torch.Tensor) -> Dict[str, float]:
+    with torch.no_grad():
+        logits = model(x_candidate)
+        pred_idx = int(logits.argmax(dim=1).item())
+        if hasattr(model, "to_probabilities"):
+            probs = model.to_probabilities(logits)
+        else:
+            probs = F.softmax(logits, dim=1)
+        pred_score = float(probs[0, pred_idx].item())
+    return {"pred_class": pred_idx, "pred_score": pred_score}
+
+
 def visualize(summary_path: Path, output_dir: Path, max_cells: int, device_arg: str) -> None:
-    summary = read_summary(summary_path)
+    with open(summary_path, "r", encoding="utf-8") as f:
+        summary = json.load(f)
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model_name = str(summary["model_name"])
@@ -117,15 +150,35 @@ def visualize(summary_path: Path, output_dir: Path, max_cells: int, device_arg: 
 
     device = select_device(device_arg)
     model = load_model(model_name, device)
-    base_x = preprocess_image(model, image_path, device)
+    base_rgb = preprocess_image(model, image_path, device)
 
     metrics_path = summary_path.parent / "qd_map_metrics.npz"
     metrics = np.load(metrics_path)
-    margin_loss = metrics["margin_loss"]
-    save_elite_map(margin_loss=margin_loss, out_path=output_dir / "elite_map.png")
+    if "quality_ce" in metrics:
+        quality_key = "quality_ce"
+    elif "quality_l2" in metrics:
+        quality_key = "quality_l2"
+    elif "margin_loss" in metrics:
+        quality_key = "margin_loss"
+    else:
+        raise KeyError("Cannot find quality map in metrics file.")
+
+    quality_map = metrics[quality_key]
+    l2_max = float(summary.get("l2_max", np.nanmax(metrics["l2"]) if "l2" in metrics else 1.0))
+    elite_map_path = output_dir / "elite_map.png"
+    save_elite_map(quality_map=quality_map, out_path=elite_map_path, l2_max=l2_max, quality_label=quality_key)
 
     qd_cells: List[Dict[str, object]] = summary.get("qd_cells", [])
-    qd_cells = sorted(qd_cells, key=lambda x: float(x["margin_loss"]))
+    def row_quality(row: Dict[str, object]) -> float:
+        if "quality_ce" in row:
+            return float(row["quality_ce"])
+        if "quality_l2" in row:
+            return float(row["quality_l2"])
+        if "margin_loss" in row:
+            return float(row["margin_loss"])
+        return float("inf")
+
+    qd_cells = sorted(qd_cells, key=row_quality)
     if max_cells > 0:
         qd_cells = qd_cells[:max_cells]
 
@@ -137,16 +190,21 @@ def visualize(summary_path: Path, output_dir: Path, max_cells: int, device_arg: 
         writer = csv.DictWriter(
             csv_file,
             fieldnames=[
+                "index",
                 "iou_bin",
                 "l2_bin",
+                "quality",
+                "quality_name",
                 "margin_loss",
                 "iou",
                 "l2",
                 "pred_class",
                 "pred_name",
-                "success",
+                "pred_score",
+                "consistent",
                 "delta_path",
-                "attack_image_path",
+                "candidate_image_path",
+                "weight_map_path",
             ],
         )
         writer.writeheader()
@@ -162,19 +220,33 @@ def visualize(summary_path: Path, output_dir: Path, max_cells: int, device_arg: 
             if delta.ndim == 3:
                 delta = delta.unsqueeze(0)
 
-            x_candidate_rgb = reconstruct_candidate_rgb(base_x, delta)
+            x_candidate_rgb = reconstruct_candidate_rgb(base_rgb, delta)
+            x_candidate = to_model_input(x_candidate_rgb)
+
             stem = f"candidate_{index:04d}_iou{iou_bin}_l2{l2_bin}"
             candidate_path = cells_dir / f"{stem}.png"
+            weight_map_path = cells_dir / f"{stem}_weight_map.png"
 
-            pred_class = int(row["pred"])
+            pred_info = get_prediction_info(model, x_candidate)
+            pred_class = int(pred_info["pred_class"])
+            pred_score = float(pred_info["pred_score"])
             pred_name = class_name(pred_class)
-            success = bool(row["success"])
-            margin_value = float(row["margin_loss"])
 
+            x_local = x_candidate.detach().clone().requires_grad_(True)
+            explanation = model.explain(x_local, idx=original_class)
+            weight_map = explanation["contribution_map"][0].detach()
+
+            margin_value = float(row.get("margin_loss", np.nan))
+            quality_value = row_quality(row)
             save_candidate_rgb(
                 x_candidate_rgb,
                 candidate_path,
-                title=f"idx={index} margin={margin_value:.4f} pred={pred_class}",
+                title=f"idx={index} {quality_key}={quality_value:.4f} pred={pred_class} score={pred_score:.4f}",
+            )
+            save_weight_map(
+                weight_map,
+                weight_map_path,
+                title=f"Weight map idx={index}",
             )
 
             writer.writerow(
@@ -182,14 +254,18 @@ def visualize(summary_path: Path, output_dir: Path, max_cells: int, device_arg: 
                     "index": index,
                     "iou_bin": iou_bin,
                     "l2_bin": l2_bin,
+                    "quality": quality_value,
+                    "quality_name": quality_key,
                     "margin_loss": margin_value,
-                    "iou": float(row["iou"]),
-                    "l2": float(row["l2"]),
+                    "iou": float(row.get("iou", np.nan)),
+                    "l2": float(row.get("l2", np.nan)),
                     "pred_class": pred_class,
                     "pred_name": pred_name,
-                    "success": success,
+                    "pred_score": pred_score,
+                    "consistent": bool(row.get("consistent", not bool(row.get("success", False)))),
                     "delta_path": str(delta_path),
-                    "attack_image_path": str(candidate_path),
+                    "candidate_image_path": str(candidate_path),
+                    "weight_map_path": str(weight_map_path),
                 }
             )
 
@@ -197,12 +273,12 @@ def visualize(summary_path: Path, output_dir: Path, max_cells: int, device_arg: 
         "model": model_name,
         "image": str(image_path),
         "original_class": original_class,
-        "original_class_name": class_name(original_class),
         "occupied_cells": int(summary.get("occupied_cells", 0)),
-        "success_cells": int(summary.get("success_cells", 0)),
+        "consistent_cells": int(summary.get("consistent_cells", summary.get("success_cells", 0))),
+        "quality_name": quality_key,
         "visualized_cells": len(qd_cells),
+        "elite_map": str(elite_map_path),
         "report_csv": str(csv_path),
-        "elite_map": str(output_dir / "elite_map.png"),
     }
     with open(output_dir / "visualization_summary.json", "w", encoding="utf-8") as f:
         json.dump(report_summary, f, ensure_ascii=False, indent=2)
@@ -211,31 +287,11 @@ def visualize(summary_path: Path, output_dir: Path, max_cells: int, device_arg: 
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Visualize and report QD ES attack results.")
-    parser.add_argument(
-        "--summary",
-        type=Path,
-        required=True,
-        help="Path to summary.json produced by qd_es_blackbox_attack.py",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=Path,
-        default=Path("results/qd_attack_visualization"),
-        help="Directory to save plots and reports",
-    )
-    parser.add_argument(
-        "--max_cells",
-        type=int,
-        default=40,
-        help="Maximum number of occupied cells to visualize (sorted by smallest margin loss)",
-    )
-    parser.add_argument(
-        "--device",
-        default="auto",
-        choices=["auto", "cpu", "cuda"],
-        help="Device for recomputing explanations",
-    )
+    parser = argparse.ArgumentParser(description="Visualize QD optimization results")
+    parser.add_argument("--summary", type=Path, required=True, help="Path to summary.json")
+    parser.add_argument("--output_dir", type=Path, default=Path("results/qd_visualization"))
+    parser.add_argument("--max_cells", type=int, default=40)
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     return parser.parse_args()
 
 

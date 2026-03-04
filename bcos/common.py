@@ -104,7 +104,7 @@ class BcosUtilMixin:
         Parameters
         ----------
         in_tensor : Tensor
-            The input tensor to explain. Must be 4-dimensional and have batch size of 1.
+            The input tensor to explain. Must be 4-dimensional.
         idx : int, optional
             The index of the output to explain. If None, the prediction is explained.
         grad2img_kwargs : Any
@@ -141,14 +141,13 @@ class BcosUtilMixin:
             Namely, the following keys are present:
             - "prediction": The prediction of the model.
             - "explained_class_idx": The class (index) of the explained output.
+            - "logits": The raw model output logits.
             - "dynamic_linear_weights": The dynamic linear weights of the model (`in_tensor.grad`).
             - "contribution_map": The contribution map of the model prediction.
             - "explanation": The explanation of the model prediction.
         """
         if in_tensor.ndim == 3:
             raise ValueError("Expected 4-dimensional input tensor")
-        if in_tensor.shape[0] != 1:
-            raise ValueError("Expected batch size of 1")
         if not in_tensor.requires_grad:
             warnings.warn(
                 "Input tensor did not require grad! Has been set automatically to True!"
@@ -166,27 +165,54 @@ class BcosUtilMixin:
         with torch.enable_grad(), self.explanation_mode():
             # fwd + prediction
             out = self(in_tensor)  # noqa
+            result["logits"] = out.detach().cpu()
+            result["logit"] = out.detach().cpu()
             pred_out = out.max(1)
-            result["prediction"] = pred_out.indices.item()
+            if in_tensor.shape[0] == 1:
+                result["prediction"] = pred_out.indices.item()
+            else:
+                result["prediction"] = pred_out.indices.detach().cpu().tolist()
 
             # select output (logit) to explain
             if idx is None:  # explain prediction
                 to_be_explained_logit = pred_out.values
-                result["explained_class_idx"] = pred_out.indices.item()
-            else:  # user specified idx
-                to_be_explained_logit = out[0, idx]
-                result["explained_class_idx"] = idx
+                explained_idx = pred_out.indices
+            elif isinstance(idx, int):  # single class for whole batch
+                to_be_explained_logit = out[:, idx]
+                explained_idx = torch.full_like(pred_out.indices, idx)
+            else:  # per-sample class idx
+                idx_tensor = torch.as_tensor(idx, device=out.device)
+                if idx_tensor.ndim != 1 or idx_tensor.shape[0] != out.shape[0]:
+                    raise ValueError(
+                        "If `idx` is not int/None, it must be a 1D tensor/list with length equal to batch size."
+                    )
+                to_be_explained_logit = out.gather(1, idx_tensor.view(-1, 1)).squeeze(1)
+                explained_idx = idx_tensor
 
-            to_be_explained_logit.backward(inputs=[in_tensor])
+            if in_tensor.shape[0] == 1:
+                result["explained_class_idx"] = int(explained_idx[0].item())
+            else:
+                result["explained_class_idx"] = explained_idx.detach().cpu().tolist()
+
+            to_be_explained_logit.sum().backward(inputs=[in_tensor])
 
         # get weights and contribution map
         result["dynamic_linear_weights"] = in_tensor.grad
         result["contribution_map"] = (in_tensor * in_tensor.grad).sum(1)
 
         # generate (color) explanation
-        result["explanation"] = gradient_to_image(
-            in_tensor[0], in_tensor.grad[0], **grad2img_kwargs
-        )
+        if in_tensor.shape[0] == 1:
+            result["explanation"] = gradient_to_image(
+                in_tensor[0], in_tensor.grad[0], **grad2img_kwargs
+            )
+        else:
+            result["explanation"] = np.stack(
+                [
+                    gradient_to_image(in_tensor[i], in_tensor.grad[i], **grad2img_kwargs)
+                    for i in range(in_tensor.shape[0])
+                ],
+                axis=0,
+            )
 
         return result
 
