@@ -386,19 +386,19 @@ class Attack:
                     "descriptor_2": offspring_metrics["descriptor_2"].copy(),
                     "pred": offspring_metrics["pred"].copy(),
                 }
-            print(metrics)
+            # print(metrics)
 
             # print(metrics)
             iter_best_ce = float(np.min(metrics["ce"]))
             best_ce = min(best_ce, iter_best_ce)
             history_best_ce.append(best_ce)
 
-            print(
-                f"Iter {iteration + 1}/{self.num_iterations}, "
-                f"Best CE: {best_ce:.4f}, "
-                f"Iter Best CE: {iter_best_ce:.4f}, "
-                f"Occupied Cells: {self.elite_map.occupied_cells()}"
-            )
+            # print(
+            #     f"Iter {iteration + 1}/{self.num_iterations}, "
+            #     f"Best CE: {best_ce:.4f}, "
+            #     f"Iter Best CE: {iter_best_ce:.4f}, "
+            #     f"Occupied Cells: {self.elite_map.occupied_cells()}"
+            # )
 
         return {
             "original_label": original_label,
