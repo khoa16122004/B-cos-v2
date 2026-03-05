@@ -26,6 +26,7 @@
 
 from bcos.models import pretrained
 import torch
+import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -80,29 +81,38 @@ def load_model(model_name: str):
 
 model = load_model("resnet18")
 device = next(model.parameters()).device
+img = Image.open("test_imgs/2_birds.jpg").convert("RGB")
+transform_class = model.transform
 
-cat_img = Image.open("cat.png").convert("RGB")
-dog_img = Image.open("dog.jpg").convert("RGB")
+print(transform_class.transforms.transforms[:-2])
 
-print(model.transform)
-batch = torch.stack(
-    [model.transform(cat_img), model.transform(dog_img)], dim=0
-).to(device).requires_grad_()
+raise
 
-results = model.explain(batch)
-logits = results.get("logits", results.get("logit"))
+def add_uniform_int_noise(pil_img: Image.Image, epsilon: int = 8) -> Image.Image:
+    img_np = np.asarray(pil_img).astype(np.int16)
+    noise = np.random.randint(-epsilon, epsilon + 1, size=img_np.shape, dtype=np.int16)
+    noisy_np = np.clip(img_np + noise, 0, 255).astype(np.uint8)
+    return Image.fromarray(noisy_np)
 
-if logits is None:
-    raise KeyError("Không thấy key 'logits'/'logit' trong kết quả explain().")
 
-print("batch shape:", batch.shape)
-print("logits shape:", logits.shape)
-print("pred idx (cat, dog):", results["prediction"])
-print("map shape:", results["contribution_map"].shape)
-print("explanation shape:", results["explanation"].shape) # batch x w x h x 4
-print("explanation dtype:", results["explanation"].dtype) # float
-plt.imshow(results["explanation"][0])  # show explanation for cat
+img_tensor = model.transform(img).unsqueeze(0).to(device).requires_grad_(True)
+results_clean = model.explain(img_tensor, 12)
+
+noisy_img = add_uniform_int_noise(img, epsilon=8)
+noisy_tensor = model.transform(noisy_img).unsqueeze(0).to(device).requires_grad_(True)
+results_noisy = model.explain(noisy_tensor, 12)
+
+clean_map = results_clean["explanation"]
+noisy_map = results_noisy["explanation"]
+
+plt.imshow(clean_map)
 plt.show()
+plt.imshow(noisy_map)
+plt.show()
+
+
+
+
 
 
 

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
+from torchvision import transforms
 
 try:
     from attack.utils import load_model, save_map_image
@@ -51,6 +52,23 @@ def to_numpy_map(explanation_map) -> np.ndarray:
     return arr
 
 
+def split_attack_transforms(model) -> tuple:
+    transform_obj = model.transform
+    if hasattr(transform_obj, "transforms") and hasattr(transform_obj.transforms, "transforms"):
+        transform_list = list(transform_obj.transforms.transforms)
+    elif hasattr(transform_obj, "transforms"):
+        transform_list = list(transform_obj.transforms)
+    else:
+        raise ValueError("Cannot split model.transform into spatial and bcos parts.")
+
+    if len(transform_list) < 3:
+        raise ValueError("model.transform has fewer than 3 steps; cannot split with current attack rule.")
+
+    spatial_transform = transforms.Compose(transform_list[:-3])
+    bcos_transform = transforms.Compose(transform_list[-3:])
+    return spatial_transform, bcos_transform
+
+
 def main() -> None:
     args = parse_args()
     summary = load_summary(args.summary)
@@ -65,33 +83,36 @@ def main() -> None:
 
     model = load_model(model_name)
     device = next(model.parameters()).device
+    spatial_transform, bcos_transform = split_attack_transforms(model)
 
-    base_img = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+    base_pil = Image.open(image_path).convert("RGB")
+    spatial_img = spatial_transform(base_pil)
+    base_img = np.asarray(spatial_img, dtype=np.uint8).copy()
 
     report = []
     for row in tqdm(summary["perturbation_files"], desc="Visualizing perturbation cells"):
         cell = row["cell"]
-        diff_idx, l2_idx = int(cell[0]), int(cell[1])
+        descriptor_1_idx, descriptor_2_idx = int(cell[0]), int(cell[1])
         perturb_path = Path(str(row["path"]))
         if not perturb_path.exists():
             continue
 
         perturbation = np.load(perturb_path)
-        adv_img = np.clip(base_img.astype(np.int16) + perturbation.astype(np.int16), 0, 255).astype(np.uint8)
+        adv_img = np.clip(base_img.astype(np.int16) + perturbation.astype(np.int16), 0, 255).astype(np.uint8).copy()
 
         adv_pil = Image.fromarray(adv_img)
-        adv_tensor = model.transform(adv_pil).unsqueeze(0).to(device).requires_grad_(True)
+        adv_tensor = bcos_transform(adv_pil).unsqueeze(0).to(device).requires_grad_(True)
         explain_result = model.explain(adv_tensor)
         explanation_map = to_numpy_map(explain_result["explanation"])
 
-        adv_path = output_dir / f"cell_d{diff_idx}_l{l2_idx}_adv.png"
-        exp_path = output_dir / f"cell_d{diff_idx}_l{l2_idx}_explanation.png"
+        adv_path = output_dir / f"cell_d{descriptor_1_idx}_l{descriptor_2_idx}_adv.png"
+        exp_path = output_dir / f"cell_d{descriptor_1_idx}_l{descriptor_2_idx}_explanation.png"
         Image.fromarray(adv_img).save(adv_path)
         save_map_image(explanation_map, exp_path)
 
         report.append(
             {
-                "cell": [diff_idx, l2_idx],
+                "cell": [descriptor_1_idx, descriptor_2_idx],
                 "perturbation_path": str(perturb_path),
                 "adversarial_image_path": str(adv_path),
                 "explanation_path": str(exp_path),
