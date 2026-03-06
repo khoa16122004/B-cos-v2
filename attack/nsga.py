@@ -87,6 +87,8 @@ class NSGABcosAttack:
         gt_contribution_map: torch.Tensor,
         gt_label: int,
     ) -> Dict[str, np.ndarray]:
+        # checked
+
         model_batch = self._to_model_batch(adversarial_imgs).requires_grad_(True)
         explain_results = self.model.explain(model_batch, gt_label)
 
@@ -144,20 +146,23 @@ class NSGABcosAttack:
         }
 
     def _sample_parent_pairs(self, pool_size: int) -> Tuple[np.ndarray, np.ndarray]:
+        # checked
         idx_a = np.random.choice(pool_size, size=self.population_size, replace=True)
         non_zero_offsets = np.random.choice(np.arange(1, pool_size), size=self.population_size, replace=True)
         idx_b = (idx_a + non_zero_offsets) % pool_size
         return idx_a.astype(np.int64, copy=True), idx_b.astype(np.int64, copy=True)
 
     def _crossover(self, noise_a: np.ndarray, noise_b: np.ndarray) -> np.ndarray:
+        # checked
         alpha = np.random.uniform(
-            self.crossover_alpha_min,
-            self.crossover_alpha_max,
+            -self.epsilon,
+            self.epsilon,
             size=(noise_a.shape[0], 1, 1, 1),
         ).astype(np.float32)
-        return (alpha * noise_a + (1.0 - alpha) * noise_b).astype(np.float32, copy=True)
+        return np.clip(alpha * noise_a + (1.0 - alpha) * noise_b, -self.epsilon, self.epsilon).astype(np.float32, copy=True)
 
     def _mutate(self, offspring_noises: np.ndarray) -> np.ndarray:
+        # checked
         mutation_prob = float(np.clip(self.mutation_sigma, 0.0, 1.0))
         random_perturbations = np.random.randint(
             low=-self.epsilon,
@@ -170,11 +175,14 @@ class NSGABcosAttack:
         return np.clip(mutated, -self.epsilon, self.epsilon).astype(np.int16).copy()
 
     def _build_adversarial_images(self, base_img: np.ndarray, perturbations: np.ndarray) -> np.ndarray:
+        # Checked
+        
         return np.clip(
             base_img[None, ...].astype(np.int16) + perturbations,
             0,
             255,
         ).astype(np.uint8).copy()
+
 
     def _to_objectives(self, metrics: Dict[str, np.ndarray]) -> np.ndarray:
         obj_ce = metrics["ce"]
@@ -270,15 +278,18 @@ class NSGABcosAttack:
         return int(score_ties[np.argmin(tie_ce)])
 
     def _current_archive_indices(self, metrics: Dict[str, np.ndarray]) -> np.ndarray:
+        # checked: lấy ra rank 0
         objectives = self._to_objectives(metrics)
         fronts = self.nds.do(objectives, n_stop_if_ranked=objectives.shape[0])
         return np.asarray(fronts[0], dtype=np.int64)
 
     def run(self, img: Image.Image) -> NSGAResult:
-        img = self.spatial_transform(img)
-        base_img = np.asarray(img, dtype=np.uint8).copy()
 
-        original_tensor = self.bcos_transform(img).unsqueeze(0).to(self.device).requires_grad_(True)
+        # repair for Attack
+        img = self.spatial_transform(img) # PIL Image
+        base_img = np.asarray(img, dtype=np.uint8).copy() # np image, shape: (H, W, C)
+
+        original_tensor = self.bcos_transform(img).unsqueeze(0).to(self.device).requires_grad_(True) # tensor
         original_results = self.model.explain(original_tensor)
         original_explain_map = original_results["explanation"]
         original_contribution_map = original_results["contribution_map"]
@@ -291,14 +302,13 @@ class NSGABcosAttack:
         else:
             original_label = int(prediction)
 
-        print(f"Original prediction: {original_label}")
-
+        # init population with random nois: int in [-epsilon, epsilon]
         population_noise = np.random.randint(
             low=-self.epsilon,
             high=self.epsilon + 1,
             size=(self.population_size, *base_img.shape),
             dtype=np.int16,
-        ).copy()
+        ).copy() # shape: (population_size, H, W, C)
         population_images = self._build_adversarial_images(base_img, population_noise)
         metrics = self.evaluate(
             population_images,

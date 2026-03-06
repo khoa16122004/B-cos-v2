@@ -84,7 +84,7 @@ device = next(model.parameters()).device
 img = Image.open("test_imgs/2_birds.jpg").convert("RGB")
 transform_class = model.transform
 
-print(transform_class.transforms.transforms[:-2])
+print(transform_class.transforms)
 
 raise
 
